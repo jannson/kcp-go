@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"golang.org/x/net/ipv4"
 )
 
 type errTimeout struct {
@@ -421,13 +420,14 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 func (s *UDPSession) SetDSCP(dscp int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.l == nil {
-		if nc, ok := s.conn.(*connectedUDPConn); ok {
-			return ipv4.NewConn(nc.UDPConn).SetTOS(dscp << 2)
-		} else if nc, ok := s.conn.(net.Conn); ok {
-			return ipv4.NewConn(nc).SetTOS(dscp << 2)
-		}
-	}
+	//remove ipv4 dependency
+	//if s.l == nil {
+	//	if nc, ok := s.conn.(*connectedUDPConn); ok {
+	//		return ipv4.NewConn(nc.UDPConn).SetTOS(dscp << 2)
+	//	} else if nc, ok := s.conn.(net.Conn); ok {
+	//		return ipv4.NewConn(nc).SetTOS(dscp << 2)
+	//	}
+	//}
 	return errors.New(errInvalidOperation)
 }
 
@@ -800,9 +800,10 @@ func (l *Listener) SetWriteBuffer(bytes int) error {
 
 // SetDSCP sets the 6bit DSCP field of IP header
 func (l *Listener) SetDSCP(dscp int) error {
-	if nc, ok := l.conn.(net.Conn); ok {
-		return ipv4.NewConn(nc).SetTOS(dscp << 2)
-	}
+	//remove ipv4 dependency
+	//if nc, ok := l.conn.(net.Conn); ok {
+	//	return ipv4.NewConn(nc).SetTOS(dscp << 2)
+	//}
 	return errors.New(errInvalidOperation)
 }
 
