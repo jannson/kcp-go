@@ -394,7 +394,7 @@ func (kcp *KCP) parse_ack(sn uint32) {
 	}
 }
 
-func (kcp *KCP) parse_fastack(sn uint32) {
+func (kcp *KCP) parse_fastack(sn, ts uint32) {
 	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
 	}
@@ -403,7 +403,7 @@ func (kcp *KCP) parse_fastack(sn uint32) {
 		seg := &kcp.snd_buf[k]
 		if _itimediff(sn, seg.sn) < 0 {
 			break
-		} else if sn != seg.sn {
+		} else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
 			seg.fastack++
 		}
 	}
@@ -430,12 +430,13 @@ func (kcp *KCP) ack_push(sn, ts uint32) {
 	kcp.acklist = append(kcp.acklist, ackItem{sn, ts})
 }
 
-func (kcp *KCP) parse_data(newseg segment) {
+// returns true if data has repeated
+func (kcp *KCP) parse_data(newseg segment) bool {
 	sn := newseg.sn
 	if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) >= 0 ||
 		_itimediff(sn, kcp.rcv_nxt) < 0 {
 		kcp.delSegment(newseg)
-		return
+		return true
 	}
 
 	n := len(kcp.rcv_buf) - 1
@@ -445,7 +446,6 @@ func (kcp *KCP) parse_data(newseg segment) {
 		seg := &kcp.rcv_buf[i]
 		if seg.sn == sn {
 			repeat = true
-			atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 			break
 		}
 		if _itimediff(sn, seg.sn) > 0 {
@@ -455,6 +455,11 @@ func (kcp *KCP) parse_data(newseg segment) {
 	}
 
 	if !repeat {
+		// replicate the content if it's new
+		dataCopy := xmitBuf.Get().([]byte)[:len(newseg.data)]
+		copy(dataCopy, newseg.data)
+		newseg.data = dataCopy
+
 		if insert_idx == n+1 {
 			kcp.rcv_buf = append(kcp.rcv_buf, newseg)
 		} else {
@@ -462,8 +467,6 @@ func (kcp *KCP) parse_data(newseg segment) {
 			copy(kcp.rcv_buf[insert_idx+1:], kcp.rcv_buf[insert_idx:])
 			kcp.rcv_buf[insert_idx] = newseg
 		}
-	} else {
-		kcp.delSegment(newseg)
 	}
 
 	// move available data from rcv_buf -> rcv_queue
@@ -481,6 +484,8 @@ func (kcp *KCP) parse_data(newseg segment) {
 		kcp.rcv_queue = append(kcp.rcv_queue, kcp.rcv_buf[:count]...)
 		kcp.rcv_buf = kcp.remove_front(kcp.rcv_buf, count)
 	}
+
+	return repeat
 }
 
 // Input when you received a low level packet (eg. UDP packet), call it
@@ -545,10 +550,11 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 				lastackts = ts
 			}
 		} else if cmd == IKCP_CMD_PUSH {
+			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
 				kcp.ack_push(sn, ts)
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
-					seg := kcp.newSegment(int(length))
+					var seg segment
 					seg.conv = conv
 					seg.cmd = cmd
 					seg.frg = frg
@@ -556,12 +562,11 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 					seg.ts = ts
 					seg.sn = sn
 					seg.una = una
-					copy(seg.data, data[:length])
-					kcp.parse_data(seg)
-				} else {
-					atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
+					seg.data = data[:length] // delayed data copying
+					repeat = kcp.parse_data(seg)
 				}
-			} else {
+			}
+			if regular && repeat {
 				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 			}
 		} else if cmd == IKCP_CMD_WASK {
@@ -580,7 +585,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
 
 	if flag != 0 && regular {
-		kcp.parse_fastack(maxack)
+		kcp.parse_fastack(maxack, lastackts)
 		current := currentMs()
 		if _itimediff(current, lastackts) >= 0 {
 			kcp.update_ack(_itimediff(current, lastackts))
@@ -774,6 +779,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		}
 
 		if needsend {
+			current = currentMs() // time update for a blocking call
 			segment.xmit++
 			segment.ts = current
 			segment.wnd = seg.wnd
@@ -784,7 +790,6 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 
 			if size+need > int(kcp.mtu) {
 				kcp.output(buffer, size)
-				current = currentMs() // time update for a blocking call
 				ptr = buffer
 			}
 
