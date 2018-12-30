@@ -19,10 +19,8 @@ const portEcho = "127.0.0.1:9999"
 const portSink = "127.0.0.1:19999"
 const portTinyBufferEcho = "127.0.0.1:29999"
 const portListerner = "127.0.0.1:9998"
-const salt = "kcptest"
 
 var key = []byte("testkey")
-var fec = 4
 var pass = pbkdf2.Key(key, []byte(portSink), 4096, 32, sha1.New)
 
 func init() {
@@ -50,9 +48,9 @@ func dialEcho() (*UDPSession, error) {
 	sess.SetStreamMode(true)
 	sess.SetStreamMode(false)
 	sess.SetStreamMode(true)
-	sess.SetWindowSize(4096, 4096)
-	sess.SetReadBuffer(4 * 1024 * 1024)
-	sess.SetWriteBuffer(4 * 1024 * 1024)
+	sess.SetWindowSize(2048, 2048)
+	sess.SetReadBuffer(16 * 1024 * 1024)
+	sess.SetWriteBuffer(16 * 1024 * 1024)
 	sess.SetStreamMode(true)
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetMtu(1400)
@@ -70,13 +68,13 @@ func dialSink() (*UDPSession, error) {
 	}
 
 	sess.SetStreamMode(true)
-	sess.SetWindowSize(4096, 4096)
-	sess.SetReadBuffer(4 * 1024 * 1024)
-	sess.SetWriteBuffer(4 * 1024 * 1024)
+	sess.SetWindowSize(2048, 2048)
+	sess.SetReadBuffer(16 * 1024 * 1024)
+	sess.SetWriteBuffer(16 * 1024 * 1024)
 	sess.SetStreamMode(true)
 	sess.SetNoDelay(1, 10, 2, 1)
 	sess.SetMtu(1400)
-	sess.SetACKNoDelay(true)
+	sess.SetACKNoDelay(false)
 	sess.SetDeadline(time.Now().Add(time.Minute))
 	return sess, err
 }
