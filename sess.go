@@ -11,6 +11,7 @@ import (
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 type errTimeout struct {
@@ -91,7 +92,8 @@ type (
 		die          chan struct{} // notify current session has Closed
 		chReadEvent  chan struct{} // notify Read() can be called without blocking
 		chWriteEvent chan struct{} // notify Write() can be called without blocking
-		chErrorEvent chan error    // notify Read() have an error
+		chReadError  chan error    // notify PacketConn.Read() have an error
+		chWriteError chan error    // notify PacketConn.Write() have an error
 
 		// nonce generator
 		nonce Entropy
@@ -117,7 +119,8 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
-	sess.chErrorEvent = make(chan error, 1)
+	sess.chReadError = make(chan error, 1)
+	sess.chWriteError = make(chan error, 1)
 	sess.remote = remote
 	sess.conn = conn
 	sess.l = l
@@ -179,6 +182,7 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			n = copy(b, s.bufptr)
 			s.bufptr = s.bufptr[n:]
 			s.mu.Unlock()
+			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
@@ -188,10 +192,10 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		}
 
 		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
-			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 			if len(b) >= size { // receive data into 'b' directly
 				s.kcp.Recv(b)
 				s.mu.Unlock()
+				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 				return size, nil
 			}
 
@@ -206,6 +210,7 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 			n = copy(b, s.recvbuf)   // copy to 'b'
 			s.bufptr = s.recvbuf[n:] // pointer update
 			s.mu.Unlock()
+			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
@@ -229,7 +234,7 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		case <-s.chReadEvent:
 		case <-c:
 		case <-s.die:
-		case err = <-s.chErrorEvent:
+		case err = <-s.chReadError:
 			if timeout != nil {
 				timeout.Stop()
 			}
@@ -293,6 +298,11 @@ func (s *UDPSession) Write(b []byte) (n int, err error) {
 		case <-s.chWriteEvent:
 		case <-c:
 		case <-s.die:
+		case err = <-s.chWriteError:
+			if timeout != nil {
+				timeout.Stop()
+			}
+			return n, err
 		}
 
 		if timeout != nil {
@@ -422,10 +432,11 @@ func (s *UDPSession) SetDSCP(dscp int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.l == nil {
-		if nc, ok := s.conn.(*connectedUDPConn); ok {
-			return ipv4.NewConn(nc.UDPConn).SetTOS(dscp << 2)
-		} else if nc, ok := s.conn.(net.Conn); ok {
-			return ipv4.NewConn(nc).SetTOS(dscp << 2)
+		if nc, ok := s.conn.(net.Conn); ok {
+			if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err != nil {
+				return ipv6.NewConn(nc).SetTrafficClass(dscp)
+			}
+			return nil
 		}
 	}
 	return errors.New(errInvalidOperation)
@@ -499,6 +510,8 @@ func (s *UDPSession) output(buf []byte) {
 		if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
 			nbytes += n
 			npkts++
+		} else {
+			s.notifyWriteError(err)
 		}
 	}
 
@@ -506,6 +519,8 @@ func (s *UDPSession) output(buf []byte) {
 		if n, err := s.conn.WriteTo(ecc[k], s.remote); err == nil {
 			nbytes += n
 			npkts++
+		} else {
+			s.notifyWriteError(err)
 		}
 	}
 	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
@@ -537,6 +552,13 @@ func (s *UDPSession) notifyReadEvent() {
 func (s *UDPSession) notifyWriteEvent() {
 	select {
 	case s.chWriteEvent <- struct{}{}:
+	default:
+	}
+}
+
+func (s *UDPSession) notifyWriteError(err error) {
+	select {
+	case s.chWriteError <- err:
 	default:
 	}
 }
@@ -627,8 +649,17 @@ func (s *UDPSession) kcpInput(data []byte) {
 // the read loop for a client session
 func (s *UDPSession) readLoop() {
 	buf := make([]byte, mtuLimit)
+	var src string
 	for {
-		if n, _, err := s.conn.ReadFrom(buf); err == nil {
+		if n, addr, err := s.conn.ReadFrom(buf); err == nil {
+			// make sure the packet is from the same source
+			if src == "" { // set source address
+				src = addr.String()
+			} else if addr.String() != src {
+				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+				continue
+			}
+
 			if n >= s.headerSize+IKCP_OVERHEAD {
 				data := buf[:n]
 				dataValid := false
@@ -653,7 +684,7 @@ func (s *UDPSession) readLoop() {
 				atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 			}
 		} else {
-			s.chErrorEvent <- err
+			s.chReadError <- err
 			return
 		}
 	}
@@ -778,7 +809,10 @@ func (l *Listener) SetWriteBuffer(bytes int) error {
 // SetDSCP sets the 6bit DSCP field of IP header
 func (l *Listener) SetDSCP(dscp int) error {
 	if nc, ok := l.conn.(net.Conn); ok {
-		return ipv4.NewConn(nc).SetTOS(dscp << 2)
+		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err != nil {
+			return ipv6.NewConn(nc).SetTrafficClass(dscp)
+		}
+		return nil
 	}
 	return errors.New(errInvalidOperation)
 }
@@ -892,17 +926,22 @@ func Dial(raddr string) (net.Conn, error) { return DialWithOptions(raddr, nil, 0
 
 // DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption
 func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards int) (*UDPSession, error) {
+	// network type detection
 	udpaddr, err := net.ResolveUDPAddr("udp", raddr)
 	if err != nil {
 		return nil, errors.Wrap(err, "net.ResolveUDPAddr")
 	}
+	network := "udp4"
+	if udpaddr.IP.To4() == nil {
+		network = "udp"
+	}
 
-	udpconn, err := net.DialUDP("udp", nil, udpaddr)
+	conn, err := net.ListenUDP(network, nil)
 	if err != nil {
 		return nil, errors.Wrap(err, "net.DialUDP")
 	}
 
-	return NewConn(raddr, block, dataShards, parityShards, &connectedUDPConn{udpconn})
+	return NewConn(raddr, block, dataShards, parityShards, conn)
 }
 
 // NewConn establishes a session and talks KCP protocol over a packet connection.
@@ -922,11 +961,3 @@ var refTime time.Time = time.Now()
 
 // currentMs returns current elasped monotonic milliseconds since program startup
 func currentMs() uint32 { return uint32(time.Now().Sub(refTime) / time.Millisecond) }
-
-// connectedUDPConn is a wrapper for net.UDPConn which converts WriteTo syscalls
-// to Write syscalls that are 4 times faster on some OS'es. This should only be
-// used for connections that were produced by a net.Dial* call.
-type connectedUDPConn struct{ *net.UDPConn }
-
-// WriteTo redirects all writes to the Write syscall, which is 4 times faster.
-func (c *connectedUDPConn) WriteTo(b []byte, addr net.Addr) (int, error) { return c.Write(b) }
