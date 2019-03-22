@@ -72,8 +72,6 @@ type (
 		// recvbuf turns packets into stream
 		recvbuf []byte
 		bufptr  []byte
-		// header extended output buffer, if has header
-		ext []byte
 
 		// FEC codec
 		fecDecoder *fecDecoder
@@ -143,17 +141,12 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		sess.headerSize += fecHeaderSizePlus2
 	}
 
-	// we only need to allocate extended packet buffer if we have the additional header
-	if sess.headerSize > 0 {
-		sess.ext = make([]byte, mtuLimit)
-	}
-
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
-		if size >= IKCP_OVERHEAD {
+		if size >= IKCP_OVERHEAD+sess.headerSize {
 			sess.output(buf[:size])
 		}
 	})
-	sess.kcp.SetMtu(IKCP_MTU_DEF - sess.headerSize)
+	sess.kcp.ReserveBytes(sess.headerSize)
 
 	// register current session to the global updater,
 	// which call sess.update() periodically.
@@ -390,7 +383,7 @@ func (s *UDPSession) SetMtu(mtu int) bool {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.kcp.SetMtu(mtu - s.headerSize)
+	s.kcp.SetMtu(mtu)
 	return true
 }
 
@@ -468,7 +461,6 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 
 // post-processing for sending a packet from kcp core
 // steps:
-// 0. Header extending
 // 1. FEC packet generation
 // 2. CRC32 integrity
 // 3. Encryption
@@ -476,24 +468,17 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 func (s *UDPSession) output(buf []byte) {
 	var ecc [][]byte
 
-	// 0. extend buf's header space(if necessary)
-	ext := buf
-	if s.headerSize > 0 {
-		ext = s.ext[:s.headerSize+len(buf)]
-		copy(ext[s.headerSize:], buf)
-	}
-
 	// 1. FEC encoding
 	if s.fecEncoder != nil {
-		ecc = s.fecEncoder.encode(ext)
+		ecc = s.fecEncoder.encode(buf)
 	}
 
 	// 2&3. crc32 & encryption
 	if s.block != nil {
-		s.nonce.Fill(ext[:nonceSize])
-		checksum := crc32.ChecksumIEEE(ext[cryptHeaderSize:])
-		binary.LittleEndian.PutUint32(ext[nonceSize:], checksum)
-		s.block.Encrypt(ext, ext)
+		s.nonce.Fill(buf[:nonceSize])
+		checksum := crc32.ChecksumIEEE(buf[cryptHeaderSize:])
+		binary.LittleEndian.PutUint32(buf[nonceSize:], checksum)
+		s.block.Encrypt(buf, buf)
 
 		for k := range ecc {
 			s.nonce.Fill(ecc[k][:nonceSize])
@@ -507,7 +492,7 @@ func (s *UDPSession) output(buf []byte) {
 	nbytes := 0
 	npkts := 0
 	for i := 0; i < s.dup+1; i++ {
-		if n, err := s.conn.WriteTo(ext, s.remote); err == nil {
+		if n, err := s.conn.WriteTo(buf, s.remote); err == nil {
 			nbytes += n
 			npkts++
 		} else {
