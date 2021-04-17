@@ -28,13 +28,14 @@ const (
 	IKCP_THRESH_MIN  = 2
 	IKCP_PROBE_INIT  = 7000   // 7 secs to probe window size
 	IKCP_PROBE_LIMIT = 120000 // up to 120 secs to probe window
+	IKCP_SN_OFFSET   = 12
 )
 
 // monotonic reference time point
 var refTime time.Time = time.Now()
 
-// currentMs returns current elasped monotonic milliseconds since program startup
-func currentMs() uint32 { return uint32(time.Now().Sub(refTime) / time.Millisecond) }
+// currentMs returns current elapsed monotonic milliseconds since program startup
+func currentMs() uint32 { return uint32(time.Since(refTime) / time.Millisecond) }
 
 // output_callback is a prototype which ought capture conn and call conn.Write
 type output_callback func(buf []byte, size int)
@@ -440,7 +441,7 @@ func (kcp *KCP) parse_fastack(sn, ts uint32) {
 	}
 }
 
-func (kcp *KCP) parse_una(una uint32) {
+func (kcp *KCP) parse_una(una uint32) int {
 	count := 0
 	for k := range kcp.snd_buf {
 		seg := &kcp.snd_buf[k]
@@ -454,6 +455,7 @@ func (kcp *KCP) parse_una(una uint32) {
 	if count > 0 {
 		kcp.snd_buf = kcp.remove_front(kcp.snd_buf, count)
 	}
+	return count
 }
 
 // ack append
@@ -533,6 +535,7 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 	var latest uint32 // the latest ack packet
 	var flag int
 	var inSegs uint64
+	var windowSlides bool
 
 	for {
 		var ts, sn, length, una, conv uint32
@@ -568,7 +571,9 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		if regular {
 			kcp.rmt_wnd = uint32(wnd)
 		}
-		kcp.parse_una(una)
+		if kcp.parse_una(una) > 0 {
+			windowSlides = true
+		}
 		kcp.shrink_buf()
 
 		if cmd == IKCP_CMD_ACK {
@@ -634,7 +639,11 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 					}
 					kcp.incr += (mss*mss)/kcp.incr + (mss / 16)
 					if (kcp.cwnd+1)*mss <= kcp.incr {
-						kcp.cwnd++
+						if mss > 0 {
+							kcp.cwnd = (kcp.incr + mss - 1) / mss
+						} else {
+							kcp.cwnd = kcp.incr + mss - 1
+						}
 					}
 				}
 				if kcp.cwnd > kcp.rmt_wnd {
@@ -645,7 +654,9 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		}
 	}
 
-	if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately
+	if windowSlides { // if window has slided, flush
+		kcp.flush(false)
+	} else if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately
 		kcp.flush(true)
 	}
 	return 0
@@ -690,7 +701,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	for i, ack := range kcp.acklist {
 		makeSpace(IKCP_OVERHEAD)
 		// filter jitters caused by bufferbloat
-		if ack.sn >= kcp.rcv_nxt || len(kcp.acklist)-1 == i {
+		if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
 			seg.sn, seg.ts = ack.sn, ack.ts
 			ptr = seg.encode(ptr)
 		}
@@ -1054,4 +1065,20 @@ func (kcp *KCP) remove_front(q []segment, n int) []segment {
 		return q[:newn]
 	}
 	return q[n:]
+}
+
+// Release all cached outgoing segments
+func (kcp *KCP) ReleaseTX() {
+	for k := range kcp.snd_queue {
+		if kcp.snd_queue[k].data != nil {
+			xmitBuf.Put(kcp.snd_queue[k].data)
+		}
+	}
+	for k := range kcp.snd_buf {
+		if kcp.snd_buf[k].data != nil {
+			xmitBuf.Put(kcp.snd_buf[k].data)
+		}
+	}
+	kcp.snd_queue = nil
+	kcp.snd_buf = nil
 }
